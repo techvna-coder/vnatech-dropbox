@@ -1,3 +1,4 @@
+# streamlit_app.py
 # -*- coding: utf-8 -*-
 import os
 import pickle
@@ -9,14 +10,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 
-
 from datetime import datetime, timezone
-
-def _to_epoch(mt: str) -> float:
-    try:
-        return datetime.fromisoformat(mt.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return 0.0
 
 # FAISS
 try:
@@ -39,17 +33,18 @@ except Exception:
     st.error("Please add 'bcrypt>=4.0.1' to requirements.txt")
     st.stop()
 
-# Local modules
+# Local modules (Dropbox Edition)
 try:
-    from drive_utils import (
-        authenticate_drive,
+    from dropbox_utils import (
+        authenticate_dropbox,
         list_files_in_folder,
         download_file,
         format_file_size,
-        download_embeddings_from_drive,
+        download_embeddings_from_dropbox,
+        upload_embeddings_to_dropbox,
     )
 except Exception as e:
-    st.error("Failed to import drive_utils: %s" % e)
+    st.error("Failed to import dropbox_utils: %s" % e)
     st.stop()
 
 try:
@@ -69,13 +64,14 @@ except Exception as e:
 # =========================
 EMBEDDINGS_FILE = "embeddings_meta.pkl"
 FAISS_INDEX_FILE = "faiss_index.bin"
-TOP_K = 10  # Tăng lên để có nhiều candidates cho reranking
+TOP_K = 10
 
-st.set_page_config(page_title="VNA Tech", layout="wide")
+st.set_page_config(page_title="VNA Tech (Dropbox)", layout="wide")
 
 # =========================
 # Authentication (giữ nguyên)
 # =========================
+
 def _load_credentials_from_secrets() -> Dict[str, Dict[str, str]]:
     if "auth" not in st.secrets:
         raise RuntimeError("Missing [auth] in secrets.")
@@ -91,11 +87,13 @@ def _load_credentials_from_secrets() -> Dict[str, Dict[str, str]]:
         raise RuntimeError("No valid users under [auth.users].")
     return creds
 
+
 def _verify_password(plain: str, hashed: str) -> bool:
     try:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
+
 
 def login_gate() -> Tuple[bool, str, str]:
     try:
@@ -110,7 +108,7 @@ def login_gate() -> Tuple[bool, str, str]:
         return True, u, display_name
 
     with st.form("login_form", clear_on_submit=False):
-        st.subheader("Đăng nhập để truy cập VNA Techinsight Hub")
+        st.subheader("Đăng nhập để truy cập VNA Techinsight Hub (Dropbox)")
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login")
@@ -127,6 +125,7 @@ def login_gate() -> Tuple[bool, str, str]:
 
     return False, "", ""
 
+
 def logout_button():
     if st.session_state.get("auth_ok"):
         if st.sidebar.button("Sign out"):
@@ -137,29 +136,33 @@ def logout_button():
             st.rerun()
 
 # =========================
-# Google Drive Helpers
+# Dropbox Helpers
 # =========================
 @st.cache_resource(show_spinner=False)
-def _drive_service():
-    return authenticate_drive()
+def _dropbox_client():
+    return authenticate_dropbox()
 
-def _list_drive_files() -> List[Dict[str, Any]]:
-    folder_id = st.secrets.get("DRIVE_FOLDER_ID")
-    if not folder_id:
-        st.error("DRIVE_FOLDER_ID is missing in secrets.")
+
+def _list_dropbox_files() -> List[Dict[str, Any]]:
+    folder_path = st.secrets.get("DROPBOX_FOLDER_PATH") or os.getenv("DROPBOX_FOLDER_PATH", "/Apps/VNATechInsight")
+    if not folder_path:
+        st.error("DROPBOX_FOLDER_PATH is missing in secrets or env.")
         st.stop()
-    service = _drive_service()
-    files = list_files_in_folder(service, folder_id)
+    dbx = _dropbox_client()
+    files = list_files_in_folder(dbx, folder_path)
     filtered = []
     for f in files:
         name = f.get("name", "")
         if name.lower().endswith(".pdf") or name.lower().endswith(".pptx"):
+            # Attach a path for downloader
+            f["path"] = f.get("path_display") or f.get("path_lower") or name
             filtered.append(f)
     return filtered
 
 # =========================
-# Embeddings Store & FAISS (giữ nguyên logic cũ)
+# Embeddings Store & FAISS
 # =========================
+
 def _try_load_local_index():
     if os.path.exists(EMBEDDINGS_FILE) and os.path.exists(FAISS_INDEX_FILE):
         try:
@@ -171,13 +174,14 @@ def _try_load_local_index():
             return None, None
     return None, None
 
-def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
+
+def _load_or_pull_cache_from_dropbox() -> Tuple[Any, List[Dict[str, Any]]]:
     idx, meta = _try_load_local_index()
     if idx is not None and meta is not None:
         return idx, meta
-    service = _drive_service()
-    folder_id = st.secrets.get("DRIVE_FOLDER_ID")
-    paths = download_embeddings_from_drive(service, folder_id, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
+    dbx = _dropbox_client()
+    folder_path = st.secrets.get("DROPBOX_FOLDER_PATH") or os.getenv("DROPBOX_FOLDER_PATH", "/Apps/VNATechInsight")
+    paths = download_embeddings_from_dropbox(dbx, folder_path, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
     if paths.get("embeddings_path") and paths.get("faiss_path"):
         try:
             with open(EMBEDDINGS_FILE, "rb") as f:
@@ -188,48 +192,52 @@ def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
             pass
     return None, None
 
+
 def _get_processed_file_ids(meta: List[Dict[str, Any]]) -> set:
     if not meta:
         return set()
     return {item.get("file_id") for item in meta if item.get("file_id")}
 
+
 def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str, Any]]]:
-    service = _drive_service()
-    files = _list_drive_files()
-    
+    dbx = _dropbox_client()
+    files = _list_dropbox_files()
+
     existing_index = None
     existing_meta = []
     processed_ids = set()
-    
+
     if not process_all:
-        existing_index, existing_meta = _load_or_pull_cache_from_drive()
+        existing_index, existing_meta = _load_or_pull_cache_from_dropbox()
         if existing_index is not None and existing_meta is not None:
             processed_ids = _get_processed_file_ids(existing_meta)
             st.info(f"📦 Đã load {len(existing_meta)} chunks từ {len(processed_ids)} files có sẵn")
 
-    new_files = [f for f in files if f["id"] not in processed_ids]
-    
+    # Dropbox file id may be stable; use (path) as identity
+    new_files = [f for f in files if (f.get("id") or f.get("path")) not in processed_ids]
+
     if not new_files and existing_index is not None:
         st.success("✅ Không có file mới. Sử dụng index hiện tại.")
         return existing_index, existing_meta
-    
+
     if new_files:
         st.info(f"📄 Phát hiện {len(new_files)} file mới cần xử lý")
-    
+
     new_vectors = []
     new_meta: List[Dict[str, Any]] = []
 
     progress = st.progress(0.0, text="Processing new documents...")
     n = max(len(new_files), 1)
-    
+
     for i, f in enumerate(new_files, start=1):
-        file_id = f["id"]
-        file_name = f["name"]
+        file_id = f.get("id") or f.get("path")
+        file_name = f.get("name")
         file_mtime = f.get("modifiedTime")
+        file_path = f.get("path")
         progress.progress(i / n, text="Processing %s (%d/%d)" % (file_name, i, len(new_files)))
 
         try:
-            content: BytesIO = download_file(service, file_id)
+            content: BytesIO = download_file(dbx, file_path)
         except Exception as e:
             st.warning("Failed to download '%s': %s" % (file_name, e))
             continue
@@ -247,7 +255,7 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
 
         chunks = chunk_text_smart(text, meta, chunk_size=1000, chunk_overlap=200)
         texts = [c["text"] for c in chunks]
-        
+
         try:
             vecs = get_embeddings(texts, batch_size=100)
         except Exception as e:
@@ -259,17 +267,17 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
             row = {"file_id": file_id, "file_name": file_name, "modified_time": file_mtime}
             row.update(c)
             new_meta.append(row)
-    
+
     progress.progress(1.0, text="Hoàn thành xử lý file mới")
-    
+
     if not new_vectors and not existing_meta:
-        st.error("No embeddings were created. Please check your Drive folder and parsers.")
+        st.error("No embeddings were created. Please check your Dropbox folder and parsers.")
         st.stop()
-    
+
     if new_vectors:
         new_mat = np.array(new_vectors, dtype="float32")
         faiss.normalize_L2(new_mat)
-        
+
         if existing_index is not None and existing_meta:
             existing_index.add(new_mat)
             combined_meta = existing_meta + new_meta
@@ -285,96 +293,78 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
         index = existing_index
         all_meta = existing_meta
 
+    # Save local caches
     with open(EMBEDDINGS_FILE, "wb") as f:
         pickle.dump(all_meta, f)
     faiss.write_index(index, FAISS_INDEX_FILE)
 
+    # (Optional) Upload caches back to Dropbox for portability
+    try:
+        folder_path = st.secrets.get("DROPBOX_FOLDER_PATH") or os.getenv("DROPBOX_FOLDER_PATH", "/Apps/VNATechInsight")
+        upload_embeddings_to_dropbox(_dropbox_client(), folder_path, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
+    except Exception:
+        pass
+
     return index, all_meta
 
 # =========================
-# Enhanced Retrieval & Reranking
+# Retrieval & Reranking (giữ nguyên logic)
 # =========================
+
 def _embed_query(client: OpenAI, query: str) -> np.ndarray:
     resp = client.embeddings.create(model="text-embedding-3-small", input=[query])
     v = np.array(resp.data[0].embedding, dtype="float32")
     v = v / np.linalg.norm(v)
     return v
 
+
 def _keyword_score(query: str, text: str, key_terms: List[str]) -> float:
-    """Tính keyword matching score"""
     query_lower = query.lower()
     text_lower = text.lower()
-    
     score = 0.0
     query_words = set(query_lower.split())
     text_words = set(text_lower.split())
-    
-    # Exact word matches
     common_words = query_words & text_words
     score += len(common_words) * 0.1
-    
-    # Key terms matching
     for term in key_terms:
-        if term.lower() in query_lower:
-            if term.lower() in text_lower:
-                score += 0.3
-    
-    # Phrase matching (bigrams)
-    query_bigrams = set(zip(query_lower.split()[:-1], query_lower.split()[1:]))
-    text_tokens = text_lower.split()
-    text_bigrams = set(zip(text_tokens[:-1], text_tokens[1:]))
-    common_bigrams = query_bigrams & text_bigrams
-    score += len(common_bigrams) * 0.2
-    
+        if term.lower() in query_lower and term.lower() in text_lower:
+            score += 0.3
+    from itertools import tee
+    def bigrams(tokens):
+        a, b = tee(tokens)
+        next(b, None)
+        return set(zip(a, b))
+    q_tokens = query_lower.split()
+    t_tokens = text_lower.split()
+    common_bi = bigrams(q_tokens) & bigrams(t_tokens)
+    score += len(common_bi) * 0.2
     return min(score, 1.0)
 
+
 def _rerank_results(query: str, results: List[Dict[str, Any]], top_k: int = 10) -> List[Dict[str, Any]]:
-    """Rerank kết quả dựa trên nhiều yếu tố"""
-    
     for r in results:
-        # Semantic similarity (từ FAISS)
         semantic_score = r["similarity"]
-        
-        # Keyword matching
         all_terms = r.get("local_key_terms", [])
         keyword_score = _keyword_score(query, r["text"], all_terms)
-        
-        # Content type bonus
         content_type = r.get("content_type", "general")
         type_bonus = 0.0
         if content_type in ["procedure", "specification"]:
             type_bonus = 0.1
         elif content_type == "safety_note":
             type_bonus = 0.15
-        
-        # Section completeness bonus
         if r.get("is_complete_section", False):
             type_bonus += 0.05
-        
-        # Has structure bonus (tables, lists)
         if r.get("has_tables", False):
             type_bonus += 0.05
         if r.get("has_lists", False):
             type_bonus += 0.03
-        
-        # Combined score với trọng số
-        combined_score = (
-            semantic_score * 0.65 +
-            keyword_score * 0.25 +
-            type_bonus * 0.10
-        )
-        
-        r["rerank_score"] = combined_score
+        combined = (semantic_score * 0.65 + keyword_score * 0.25 + type_bonus * 0.10)
+        r["rerank_score"] = combined
         r["keyword_score"] = keyword_score
-    
-    # Sắp xếp theo rerank_score
     reranked = sorted(results, key=lambda x: x["rerank_score"], reverse=True)
-    
-    # Diversify: đảm bảo có chunks từ nhiều files khác nhau
     diverse_results = []
     file_counts = defaultdict(int)
     max_per_file = max(2, top_k // 3)
-    
     for r in reranked:
         file_name = r["file_name"]
         if file_counts[file_name] < max_per_file or len(diverse_results) < top_k:
@@ -382,22 +372,17 @@ def _rerank_results(query: str, results: List[Dict[str, Any]], top_k: int = 10) 
             file_counts[file_name] += 1
             if len(diverse_results) >= top_k:
                 break
-    
-    # Nếu không đủ, lấy thêm
     if len(diverse_results) < top_k:
         for r in reranked:
             if r not in diverse_results:
                 diverse_results.append(r)
                 if len(diverse_results) >= top_k:
                     break
-    
     return diverse_results[:top_k]
 
+
 def _search(index, meta: List[Dict[str, Any]], qvec: np.ndarray, query: str, topk: int = TOP_K):
-    """Enhanced search với reranking"""
-    # FAISS search - lấy nhiều candidates hơn
     D, I = index.search(qvec.reshape(1, -1), topk * 2)
-    
     candidates = []
     for score, idx in zip(D[0].tolist(), I[0].tolist()):
         if idx < 0 or idx >= len(meta):
@@ -405,47 +390,29 @@ def _search(index, meta: List[Dict[str, Any]], qvec: np.ndarray, query: str, top
         item = meta[idx].copy()
         item["similarity"] = float(score)
         candidates.append(item)
-    
-    # Rerank
     final_results = _rerank_results(query, candidates, top_k=topk)
-    
     return final_results
 
+
 def _format_context(chunks: List[Dict[str, Any]]) -> str:
-    """Format context với metadata phong phú"""
     blocks = []
-    
     for i, c in enumerate(chunks, 1):
-        # Header với thông tin chi tiết
         file_name = c["file_name"]
-        section = "%s %s" % (
-            str(c.get("section_type", "?")).title(),
-            c.get("section_number", "?")
-        )
-        
+        section = f"{str(c.get('section_type', '?')).title()} {c.get('section_number', '?')}"
         title = c.get("section_title", "")
         title_str = f" - {title}" if title else ""
-        
         content_type = c.get("content_type", "general")
-        
         header = f"[{i}] {file_name} | {section}{title_str}\n"
         header += f"Type: {content_type} | Relevance: {c.get('rerank_score', 0):.3f}\n"
-        
-        # Đánh dấu nếu có tables/lists
-        if c.get("has_tables"):
-            header += "⚠️ Contains table data\n"
-        if c.get("has_lists"):
-            header += "📋 Contains structured list\n"
-        
+        if c.get("has_tables"): header += "⚠️ Contains table data\n"
+        if c.get("has_lists"): header += "📋 Contains structured list\n"
         text = c["text"]
         blocks.append(header + "---\n" + text)
-    
     return "\n\n═══════════════════\n\n".join(blocks)
 
+
 def _ask_llm(client: OpenAI, question: str, chunks: List[Dict[str, Any]]) -> str:
-    """Enhanced LLM prompting với CoT và structured output"""
     context = _format_context(chunks)
-    
     system = """Bạn là trợ lý kỹ thuật chuyên nghiệp của Vietnam Airlines.
 
 NHIỆM VỤ:
@@ -477,7 +444,6 @@ Hãy trả lời câu hỏi dựa trên các nguồn trên. Nhớ trích dẫn n
         {"role": "system", "content": system},
         {"role": "user", "content": user_msg},
     ]
-    
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -493,31 +459,28 @@ Hãy trả lời câu hỏi dựa trên các nguồn trên. Nhớ trích dẫn n
 # =========================
 # UI
 # =========================
+
 def sidebar_panel(index, meta):
-    st.sidebar.header("VNA Techinsight")
-    
+    st.sidebar.header("VNA Techinsight – Dropbox")
+
     processed_ids = _get_processed_file_ids(meta)
     with st.sidebar.expander("📊 Thống kê", expanded=True):
         st.metric("Số files đã xử lý", len(processed_ids))
         st.metric("Tổng số chunks", len(meta) if meta else 0)
-        
-        # Thống kê content types
         if meta:
             content_types = [m.get("content_type", "general") for m in meta]
             type_counts = pd.Series(content_types).value_counts()
             st.caption("**Content Types:**")
             for ctype, count in type_counts.items():
                 st.caption(f"  • {ctype}: {count}")
-        
-        st.caption("Cache được lưu **local-only** trong phiên chạy.")
-    
+        st.caption("Cache được lưu **local** và đồng bộ qua **Dropbox**.")
+
     st.sidebar.divider()
-    
+
     with st.sidebar.expander("🔧 Quản lý Index", expanded=False):
         st.write("**Embeddings**: `%s`" % EMBEDDINGS_FILE)
         st.write("**FAISS index**: `%s`" % FAISS_INDEX_FILE)
         st.divider()
-        
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔄 Cập nhật (chỉ file mới)", use_container_width=True):
@@ -527,7 +490,6 @@ def sidebar_panel(index, meta):
             if st.button("🔨 Rebuild toàn bộ", type="secondary", use_container_width=True):
                 st.session_state["force_rebuild"] = True
                 st.rerun()
-        
         if st.button("🗑️ Xoá cache (local)", type="secondary", use_container_width=True):
             try:
                 if os.path.exists(EMBEDDINGS_FILE):
@@ -540,33 +502,38 @@ def sidebar_panel(index, meta):
             st.rerun()
 
     st.sidebar.divider()
-    
+
     try:
-        files = _list_drive_files()
+        files = _list_dropbox_files()
     except Exception as e:
-        st.sidebar.error("Lỗi liệt kê Drive: %s" % e)
+        st.sidebar.error("Lỗi liệt kê Dropbox: %s" % e)
         files = []
 
     if files:
-        st.sidebar.subheader("📁 Tài liệu trong Drive")
+        st.sidebar.subheader("📁 Tài liệu trong Dropbox")
         for f in files[:100]:
-            is_new = f["id"] not in processed_ids
+            is_new = (f.get("id") or f.get("path")) not in processed_ids
             icon = "🆕" if is_new else "✅"
-            st.sidebar.caption("%s %s (%s)" % (icon, f["name"], format_file_size(f.get("size", ""))))
+            st.sidebar.caption("%s %s (%s)" % (icon, f["name"], format_file_size(f.get("size"))))
 
     logout_button()
+
 
 def main():
     ok, username, display_name = login_gate()
     if not ok:
         st.stop()
 
-    DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "1JXkaAwVD2lLbFg5bJrNRaSdxJ_oS7kEY")
-    drive_url = f"https://drive.google.com/drive/folders/{DRIVE_FOLDER_ID}?usp=sharing"
+    DROPBOX_FOLDER_PATH = st.secrets.get("DROPBOX_FOLDER_PATH") or os.getenv("DROPBOX_FOLDER_PATH", "/Apps/VNATechInsight")
+    DROPBOX_FOLDER_URL = st.secrets.get("DROPBOX_FOLDER_URL", "")
 
-    st.title("🛩️ VNA TechInsight Hub")
-    st.caption("Hệ thống tra cứu tài liệu kỹ thuật thông minh với AI")
-    st.link_button("📂 Mở thư mục Google Drive để cập nhật kiến thức cho Chatbot", drive_url)
+    st.title("🛩️ VNA TechInsight Hub (Dropbox Edition)")
+    st.caption("Hệ thống tra cứu tài liệu kỹ thuật thông minh với AI – Lưu trữ trên Dropbox")
+
+    if DROPBOX_FOLDER_URL:
+        st.link_button("📂 Mở thư mục Dropbox để cập nhật kiến thức cho Chatbot", DROPBOX_FOLDER_URL)
+    else:
+        st.info(f"Thư mục Dropbox: `{DROPBOX_FOLDER_PATH}` (thiết lập DROPBOX_FOLDER_URL trong secrets để hiện nút mở nhanh)")
 
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
@@ -581,8 +548,6 @@ def main():
     sidebar_panel(index, meta)
 
     st.subheader("💬 Đặt câu hỏi")
-    
-    # Query input với suggestions
     col1, col2 = st.columns([3, 1])
     with col1:
         question = st.text_input(
@@ -596,8 +561,7 @@ def main():
             ["Hybrid (khuyến nghị)", "Semantic only", "Keyword priority"],
             index=0
         )
-    
-    # Advanced options
+
     with st.expander("⚙️ Tùy chọn nâng cao"):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -608,32 +572,25 @@ def main():
                 options=["Ngắn gọn", "Trung bình", "Chi tiết"],
                 value="Trung bình"
             )
-    
+
     run = st.button("🔍 Tìm kiếm & Trả lời", type="primary", use_container_width=True)
 
     if run:
         if not question.strip():
             st.warning("Vui lòng nhập câu hỏi.")
             st.stop()
-
         with st.spinner("Đang phân tích câu hỏi và tìm kiếm tài liệu..."):
             qvec = _embed_query(client, question)
             results = _search(index, meta, qvec, question, topk=num_results)
-
         if not results:
             st.info("❌ Không tìm thấy đoạn trích phù hợp. Vui lòng thử câu hỏi khác hoặc kiểm tra tài liệu.")
             return
-
         with st.spinner("Đang tổng hợp và phân tích thông tin..."):
             answer = _ask_llm(client, question, results)
-
-        # Display answer
         st.markdown("### ✅ Kết quả")
         st.markdown(answer)
-
         st.markdown("---")
         st.markdown("### 📚 Nguồn tham chiếu")
-        
         df = pd.DataFrame([
             {
                 "Số": f"[{i+1}]",
@@ -648,26 +605,17 @@ def main():
             for i, r in enumerate(results)
         ])
         st.dataframe(df, use_container_width=True, hide_index=True)
-
         with st.expander("📄 Xem chi tiết các đoạn trích"):
             for i, c in enumerate(results, start=1):
                 title = c.get("section_title", "")
                 title_display = f" - {title}" if title else ""
-                
                 st.markdown(f"**[{i}] {c['file_name']}** – {str(c.get('section_type','?')).title()} {c.get('section_number','?')}{title_display}")
-                
-                # Metadata badges
                 badges = []
-                if c.get("content_type"):
-                    badges.append(f"🏷️ {c['content_type']}")
-                if c.get("has_tables"):
-                    badges.append("📊 Has tables")
-                if c.get("has_lists"):
-                    badges.append("📋 Has lists")
+                if c.get("content_type"): badges.append(f"🏷️ {c['content_type']}")
+                if c.get("has_tables"): badges.append("📊 Has tables")
+                if c.get("has_lists"): badges.append("📋 Has lists")
                 badges.append(f"⭐ {c.get('rerank_score', 0):.3f}")
-                
                 st.caption(" | ".join(badges))
-                
                 txt = c["text"]
                 if len(txt) > 1500:
                     txt = txt[:1500] + "\n\n... (truncated)"
